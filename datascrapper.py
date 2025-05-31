@@ -8,8 +8,8 @@ import os
 
 visited_urls = set()
 MAX_PAGES = 1000000
-CONCURRENT_CONTEXTS = 4  # Number of parallel browser contexts
-TASKS_PER_CONTEXT = 5    # Pages each context handles concurrently
+CONCURRENT_CONTEXTS = 4
+TASKS_PER_CONTEXT = 5
 
 timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 main_output_file = f"scraped_clean_html_{timestamp}.html"
@@ -76,9 +76,7 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
     except Exception as e:
         print(f"⚠️ Error closing page: {e}")
 
-async def context_worker(playwright, base_url, url_queue, context_id, shutdown_event):
-    browser = await playwright.chromium.launch(headless=True)
-    context = await browser.new_context()
+async def context_worker(context, base_url, url_queue, context_id, shutdown_event):
     await context.route("**/*", intercept_requests)
 
     while not shutdown_event.is_set() and len(visited_urls) < MAX_PAGES:
@@ -91,14 +89,13 @@ async def context_worker(playwright, base_url, url_queue, context_id, shutdown_e
             if url_queue.empty():
                 break
             url = await url_queue.get()
-            tasks.append(scrape_page(context_id, await context.new_page(), url, base_url, url_queue))
+            page = await context.new_page()
+            tasks.append(scrape_page(context_id, page, url, base_url, url_queue))
 
         if tasks:
             await asyncio.gather(*tasks)
         else:
             await asyncio.sleep(1)
-
-    await browser.close()
 
 async def merge_temp_files(context_ids):
     with open(main_output_file, "w", encoding="utf-8") as outfile:
@@ -141,15 +138,24 @@ async def main():
     shutdown_event = asyncio.Event()
 
     async with async_playwright() as p:
+        # ✅ Launch one shared browser
+        browser = await p.chromium.launch(headless=True)
+        
         context_ids = list(range(CONCURRENT_CONTEXTS))
+
+        # ✅ Create multiple contexts from the same browser
+        contexts = [await browser.new_context() for _ in context_ids]
+
         workers = [
-            asyncio.create_task(context_worker(p, base_url, url_queue, cid, shutdown_event))
-            for cid in context_ids
+            asyncio.create_task(context_worker(contexts[i], base_url, url_queue, context_ids[i], shutdown_event))
+            for i in range(CONCURRENT_CONTEXTS)
         ]
+
         monitor = asyncio.create_task(monitor_progress(url_queue, shutdown_event))
 
         await asyncio.gather(*workers)
         monitor.cancel()
+        await browser.close()
 
     await merge_temp_files(context_ids)
 
