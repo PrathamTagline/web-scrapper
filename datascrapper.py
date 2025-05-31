@@ -1,10 +1,12 @@
 import asyncio
 import time
+import aiohttp
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 from datetime import datetime
 import os
+import xml.etree.ElementTree as ET
 
 visited_urls = set()
 MAX_PAGES = 1000000
@@ -19,6 +21,43 @@ async def intercept_requests(route):
         await route.abort()
     else:
         await route.continue_()
+
+async def fetch_sitemap_urls(sitemap_url):
+    """Fetch and parse sitemap XML to extract all URLs."""
+    print(f"🔗 Fetching sitemap: {sitemap_url}")
+    urls = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(sitemap_url, timeout=30) as resp:
+                if resp.status != 200:
+                    print(f"⚠️ Failed to fetch sitemap {sitemap_url}, status: {resp.status}")
+                    return urls
+                text = await resp.text()
+
+                # Parse XML
+                root = ET.fromstring(text)
+
+                # Sitemap namespace handling (common sitemap XMLs use a namespace)
+                ns = {'ns': root.tag.split('}')[0].strip('{')} if '}' in root.tag else {}
+
+                # Extract <loc> elements from sitemap or sitemap index
+                if root.tag.endswith('urlset'):
+                    loc_tags = root.findall('ns:url/ns:loc', ns) if ns else root.findall('url/loc')
+                elif root.tag.endswith('sitemapindex'):
+                    loc_tags = root.findall('ns:sitemap/ns:loc', ns) if ns else root.findall('sitemap/loc')
+                else:
+                    print("⚠️ Unrecognized sitemap format")
+                    return urls
+
+                for loc in loc_tags:
+                    url = loc.text.strip()
+                    urls.append(url)
+
+                print(f"✅ Found {len(urls)} URLs in sitemap")
+    except Exception as e:
+        print(f"⚠️ Error fetching/parsing sitemap: {e}")
+
+    return urls
 
 async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
     if url in visited_urls or len(visited_urls) >= MAX_PAGES:
@@ -53,13 +92,15 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
                 f.write(soup.prettify())
                 f.write(f"\n<!-- END OF PAGE: {url} -->\n\n")
 
-            links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
-            for link in links:
-                parsed = urlparse(link)
-                if parsed.scheme.startswith("http") and base_url in parsed.netloc:
-                    clean_link = link.split("#")[0].rstrip("/")
-                    if clean_link not in visited_urls and url_queue.qsize() + len(visited_urls) < MAX_PAGES:
-                        await url_queue.put(clean_link)
+            # Extract links only if url is not from sitemap (to avoid infinite loops)
+            if urlparse(url).path.endswith('.xml') is False:
+                links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+                for link in links:
+                    parsed = urlparse(link)
+                    if parsed.scheme.startswith("http") and base_url in parsed.netloc:
+                        clean_link = link.split("#")[0].rstrip("/")
+                        if clean_link not in visited_urls and url_queue.qsize() + len(visited_urls) < MAX_PAGES:
+                            await url_queue.put(clean_link)
 
             break
 
@@ -129,10 +170,17 @@ async def monitor_progress(url_queue, shutdown_event):
         await asyncio.sleep(5)
 
 async def main():
-    start_url = "https://taglineinfotech.com/"
+    start_url = "https://taglineinfotech.com/sitemap.xml"  # Replace with your sitemap URL or regular URL
     base_url = urlparse(start_url).netloc
     url_queue = asyncio.Queue()
-    await url_queue.put(start_url.rstrip("/"))
+
+    # Detect if start_url looks like a sitemap by extension or content
+    if start_url.endswith(".xml"):
+        sitemap_urls = await fetch_sitemap_urls(start_url)
+        for url in sitemap_urls:
+            await url_queue.put(url.rstrip("/"))
+    else:
+        await url_queue.put(start_url.rstrip("/"))
 
     start_time = datetime.now()
     print(f"📝 Output File: {main_output_file}")
