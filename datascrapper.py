@@ -31,12 +31,10 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
     for attempt in range(1, retries + 1):
         try:
             start = time.time()
-            # Dynamic wait: wait until network idle or max 30s
             await page.goto(url, wait_until='networkidle')
             duration = time.time() - start
             print(f"⏱️ [{context_id}] Page loaded in {duration:.2f} seconds: {url}")
 
-            # Extra wait for body selector to ensure page rendered
             await page.wait_for_selector("body", timeout=5000)
 
             html_content = await page.content()
@@ -55,7 +53,6 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
                 f.write(soup.prettify())
                 f.write(f"\n<!-- END OF PAGE: {url} -->\n\n")
 
-            # Extract and enqueue links
             links = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
             for link in links:
                 parsed = urlparse(link)
@@ -64,7 +61,7 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
                     if clean_link not in visited_urls and url_queue.qsize() + len(visited_urls) < MAX_PAGES:
                         await url_queue.put(clean_link)
 
-            break  # success, exit retry loop
+            break
 
         except PlaywrightTimeoutError:
             print(f"⚠️ Timeout visiting {url}, attempt {attempt}/{retries}")
@@ -79,14 +76,13 @@ async def scrape_page(context_id, page, url, base_url, url_queue, retries=3):
     except Exception as e:
         print(f"⚠️ Error closing page: {e}")
 
-async def context_worker(playwright, base_url, url_queue, context_id):
+async def context_worker(playwright, base_url, url_queue, context_id, shutdown_event):
     browser = await playwright.chromium.launch(headless=True)
     context = await browser.new_context()
     await context.route("**/*", intercept_requests)
 
-    while len(visited_urls) < MAX_PAGES:
+    while not shutdown_event.is_set() and len(visited_urls) < MAX_PAGES:
         tasks = []
-        # Avoid busy waiting, break if queue empty
         if url_queue.empty():
             await asyncio.sleep(1)
             continue
@@ -100,7 +96,6 @@ async def context_worker(playwright, base_url, url_queue, context_id):
         if tasks:
             await asyncio.gather(*tasks)
         else:
-            # If no tasks to run, wait a bit before retrying
             await asyncio.sleep(1)
 
     await browser.close()
@@ -114,11 +109,23 @@ async def merge_temp_files(context_ids):
                     outfile.write(f.read())
                 os.remove(temp_file)
 
-async def monitor_progress(url_queue):
-    while True:
-        print(f"📊 Queue: {url_queue.qsize()} | Visited: {len(visited_urls)}")
-        if url_queue.empty() and len(visited_urls) >= MAX_PAGES:
-            break
+async def monitor_progress(url_queue, shutdown_event):
+    empty_since = None
+
+    while not shutdown_event.is_set():
+        qsize = url_queue.qsize()
+        print(f"📊 Queue: {qsize} | Visited: {len(visited_urls)}")
+
+        if qsize == 0:
+            if empty_since is None:
+                empty_since = time.time()
+            elif time.time() - empty_since >= 120:
+                print("🛑 Queue has been empty for 2 minutes. Assuming crawl is complete.")
+                shutdown_event.set()
+                break
+        else:
+            empty_since = None
+
         await asyncio.sleep(5)
 
 async def main():
@@ -131,16 +138,17 @@ async def main():
     print(f"📝 Output File: {main_output_file}")
     print(f"⏱️ Start Time: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
+    shutdown_event = asyncio.Event()
+
     async with async_playwright() as p:
         context_ids = list(range(CONCURRENT_CONTEXTS))
         workers = [
-            asyncio.create_task(context_worker(p, base_url, url_queue, cid))
+            asyncio.create_task(context_worker(p, base_url, url_queue, cid, shutdown_event))
             for cid in context_ids
         ]
-        monitor = asyncio.create_task(monitor_progress(url_queue))
+        monitor = asyncio.create_task(monitor_progress(url_queue, shutdown_event))
 
         await asyncio.gather(*workers)
-        # Once workers done, cancel monitoring
         monitor.cancel()
 
     await merge_temp_files(context_ids)
